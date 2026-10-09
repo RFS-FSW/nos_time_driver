@@ -20,6 +20,9 @@ ivv-itc@lists.nasa.gov
 #include <string>
 #include <curses.h>
 #include <climits>
+#include <chrono>
+#include <stdexcept>
+#include <time_driver_control.hpp>
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
@@ -49,6 +52,8 @@ namespace Nos3
         _active(config.get("simulator.active", true)),
         _time_counter(0), _display_counter(0), _pause_ticks(UINT_MAX)
     {
+        if (_sim_microseconds_per_tick <= 0 || _real_microseconds_per_tick <= 0)
+            throw std::invalid_argument("TimeDriver tick periods must be positive");
         std::string default_time_uri = config.get("common.nos-connection-string", "tcp://127.0.0.1:12001");
         std::string default_time_bus_name = "command";
         struct TimeBusInfo tbi;
@@ -99,72 +104,54 @@ namespace Nos3
 
     void TimeDriver::run(void)
     {
-        gettimeofday(&_now, NULL);
-        _then = _now;
-
-        if (_active) 
-        {
-            initscr();
-            erase();
-            keypad(stdscr, TRUE);
-            nodelay(stdscr, TRUE);
-            noecho();
-            int key = getch();
-            double pause_duration, pause_at;
-
-            while (1) 
+        if (!_active) {
+            sim_logger->info("Time driver is not active");
+            return;
+        }
+        initscr();
+        erase();
+        keypad(stdscr, TRUE);
+        nodelay(stdscr, TRUE);
+        noecho();
+        auto previous = std::chrono::steady_clock::now();
+        std::string entered;
+        while (true) {
+            const auto now = std::chrono::steady_clock::now();
             {
-                do {
-                    //std::this_thread::sleep_for(std::chrono::microseconds(_real_microseconds_per_tick/10));
-                    gettimeofday(&_now, NULL);
-                    _last_time_diff = time_diff();
-                } while (_last_time_diff < _real_microseconds_per_tick);
-
-    			int64_t ticks_per_second = 1000000/_real_microseconds_per_tick;
-                _then = _now;
-                
-                if (ticks_per_second < 10 ||  // prevent division by zero on the next line
-                    ((_display_counter % (ticks_per_second/10)) == 0)) { // only report about every 1/10th of a second
-                    update_display();
+                std::lock_guard<std::mutex> lock(_control_mutex);
+                int key = getch();
+                std::string command, reply;
+                if (!entered.empty()) {
+                    if (key == '\n' || key == '\r') { command = entered; entered.clear(); }
+                    else if (key == 27) entered.clear();
+                    else if (key == KEY_BACKSPACE || key == 127) entered.pop_back();
+                    else if (key >= 32 && key < 127 && entered.size() < 256) entered += char(key);
+                } else {
+                    switch (key) {
+                    case 'p': case 'P': command = _pause_ticks == UINT_MAX ? "PAUSE" : "UNPAUSE"; break;
+                    case '+': command = "DECREASE"; break;
+                    case '-': command = "INCREASE"; break;
+                    case 'r': case 'R': entered = "RUN "; break;
+                    case 'u': case 'U': entered = "UNTIL "; break;
+                    }
                 }
-
-                switch(key) {
-                    case 'p':
-                    case 'P':
-                        if (_pause_ticks == UINT_MAX) _pause_ticks = _time_counter;
-                        else _pause_ticks = UINT_MAX;
-                        break;
-                    case '+':
-                        if (100 * _real_microseconds_per_tick > _sim_microseconds_per_tick) _real_microseconds_per_tick /= 2; // no faster than 200x real time
-                        break;
-                    case '-':
-                        if (_real_microseconds_per_tick < _sim_microseconds_per_tick * 100) _real_microseconds_per_tick *= 2; // no slower than 0.005x real time
-                        break;
-                    case 'r':
-                    case 'R':
-                        scanf("%lf", &pause_duration);
-                        _pause_ticks = _time_counter + pause_duration * 1000000 / _sim_microseconds_per_tick;
-                        break;
-                    case 'u':
-                    case 'U':
-                        scanf("%lf", &pause_at);
-                        _pause_ticks = (pause_at - _absolute_start_time) * 1000000 / _sim_microseconds_per_tick;
-                        break;
+                if (!command.empty() && !apply_time_command(command, _sim_microseconds_per_tick,
+                        _absolute_start_time, _time_counter, _real_microseconds_per_tick, _pause_ticks, reply))
+                    sim_logger->warning("Invalid time command");
+                _last_time_diff = std::chrono::duration<double, std::micro>(now - previous).count();
+                if (_last_time_diff >= _real_microseconds_per_tick) {
+                    previous = now;
+                    const int64_t ticks_per_second = 1000000 / _real_microseconds_per_tick;
+                    if (ticks_per_second < 10 || _display_counter % (ticks_per_second/10) == 0)
+                        update_display();
+                    if (_time_counter < _pause_ticks && _time_counter < UINT_MAX - 1) {
+                        update_time_busses();
+                        ++_time_counter;
+                    }
+                    ++_display_counter;
                 }
-
-                if (_time_counter < _pause_ticks) {
-                    update_time_busses();
-                    _time_counter++;
-                }
-                _display_counter++;
-
-                key = getch();
             }
-            endwin();
-        } 
-        else 
-        {
-            sim_logger->info("TimeDriver::run:  Time driver is not active");
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 
@@ -188,7 +175,7 @@ namespace Nos3
         double second;
 
         wmove(stdscr, 0, 0);
-        double abs_time = _absolute_start_time + (double(_time_counter * _sim_microseconds_per_tick)) / 1000000.0;
+        double abs_time = _absolute_start_time + (double(_time_counter) * double(_sim_microseconds_per_tick)) / 1000000.0;
         SimCoordinateTransformations::AbsTime2YMDHMS(abs_time, year, month, day, hour, minute, second);
         double speed_up = ((double)_sim_microseconds_per_tick) / ((double)_real_microseconds_per_tick);
         double actual_speed_up = (double)_sim_microseconds_per_tick / _last_time_diff;
@@ -198,7 +185,7 @@ namespace Nos3
         printw("  real microseconds per tick = %ld, ", _real_microseconds_per_tick);
         printw("attempted speed-up = %5.2f\n", speed_up);
         printw("  actual speed-up = %5.2f, state = %s", actual_speed_up, (_pause_ticks <= _time_counter) ? "paused" : ((_pause_ticks < UINT_MAX) && (_pause_ticks > _time_counter)) ? "pausing" : "playing");
-        if ((_pause_ticks < UINT_MAX) && (_pause_ticks > _time_counter)) printw(" at %f", _absolute_start_time + (double(_pause_ticks * _sim_microseconds_per_tick)) / 1000000.0);
+        if ((_pause_ticks < UINT_MAX) && (_pause_ticks > _time_counter)) printw(" at %f", _absolute_start_time + (double(_pause_ticks) * double(_sim_microseconds_per_tick)) / 1000000.0);
         printw("\n\nPress: 'p' to pause/play,\n       '+' to decrease delay by 2x,\n       '-' to increase delay by 2x\n");
         printw(    "       'r <number>' to run <number> more seconds,\n       'u <number>' to run until <number> absolute time\n");
         refresh();
@@ -218,52 +205,15 @@ namespace Nos3
 
     void TimeDriver::command_callback(NosEngine::Common::Message msg)
     {
-        double pause_duration, pause_at;
-
-        /* Get the data out of the message */
+        std::string response = "INVALID COMMAND";
         NosEngine::Common::DataBufferOverlay dbf(const_cast<NosEngine::Utility::Buffer&>(msg.buffer));
-
-        std::string command = dbf.data;
-        std::string response = "TimeDriver::command_callback:  INVALID COMMAND! (Try HELP)";
-        boost::to_upper(command);
-        if (command.compare(0, 4, "HELP") == 0) 
-        {
-            response = "TimeDriver::command_callback: Valid commands are PAUSE, UNPAUSE, DECREASE, INCREASE, RUN <number>, and UNTIL <number>";
+        if (dbf.len <= 257) {
+            std::string command(dbf.data, dbf.len);
+            if (!command.empty() && command.back() == '\0') command.pop_back();
+            std::lock_guard<std::mutex> lock(_control_mutex);
+            apply_time_command(command, _sim_microseconds_per_tick, _absolute_start_time,
+                _time_counter, _real_microseconds_per_tick, _pause_ticks, response);
         }
-        else if (command.compare(0, 5, "PAUSE") == 0) 
-        {
-            _pause_ticks = _time_counter;
-            response = "PAUSE";
-        }
-        else if (command.compare(0, 7, "UNPAUSE") == 0) 
-        {
-            _pause_ticks = UINT_MAX;
-            response = "UNPAUSE";
-        }
-        else if (command.compare(0, 8, "DECREASE") == 0) 
-        {
-            _real_microseconds_per_tick /= 2;
-            response = "DECREASE";
-        }
-        else if (command.compare(0, 8, "INCREASE") == 0) 
-        {
-            _real_microseconds_per_tick *= 2;
-            response = "INCREASE";
-        }
-        else if (command.compare(0, 4, "RUN ") == 0) 
-        {
-            pause_duration = std::stod(command.substr(4)); // number of seconds
-            _pause_ticks = _time_counter + pause_duration * 1000000 / _sim_microseconds_per_tick;
-            response = "RUN";
-        }
-        else if (command.compare(0, 6, "UNTIL ") == 0) 
-        {
-            pause_at = std::stod(command.substr(6)); // absolute time in seconds
-            _pause_ticks = (pause_at - _absolute_start_time) * 1000000 / _sim_microseconds_per_tick;
-            response = "RUN";
-        }
-
         _command_node->send_reply_message_async(msg, response.size(), response.c_str());
     }
-
 }
