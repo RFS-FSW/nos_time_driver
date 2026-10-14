@@ -17,6 +17,7 @@ ivv-itc@lists.nasa.gov
 
 /* Standard Includes */
 #include <string>
+#include <mutex>
 
 #include <boost/property_tree/ptree.hpp>
 
@@ -45,6 +46,7 @@ namespace Nos3
         void run(void);
 
     private:
+        std::mutex _control_mutex;
         void update_display(void);
         void update_time_busses(void);
         double time_diff(void);
